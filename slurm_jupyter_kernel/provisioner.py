@@ -77,11 +77,11 @@ connection_file=$tmpfile
                 loginnode = self.loginnode + f' (via {self.proxyjump})';
             raise UnknownUsername(f'Could not login to {loginnode}! Unknown username!');
 
-        # check running SSH agent
-        try:
-            environ['SSH_AUTH_SOCK'];
-        except KeyError:
-            raise SSHAgentNotRunning('SSH Agent is not running. Start you agent using following cmd:\n$ eval $(ssh-agent)')
+        # # check running SSH agent
+        # try:
+        #     environ['SSH_AUTH_SOCK'];
+        # except KeyError:
+        #     raise SSHAgentNotRunning('SSH Agent is not running. Start you agent using following cmd:\n$ eval $(ssh-agent)')
 
         # Build sbatch job flags
         slurm_job_flags = '';
@@ -89,10 +89,10 @@ connection_file=$tmpfile
             slurm_job_flags += f'#SBATCH --{parameter}={value}\n';
 
         # build ssh command
-        proxyjump = '';
-        if self.proxyjump:
-            proxyjump = f'-J {self.proxyjump}';
-        self.ssh_command = f'ssh -tA {proxyjump} {self.loginnode}';
+        if self.proxyjump and (self.proxyjump != ''):
+            self.ssh_command = f'ssh -tA -J {self.proxyjump} {self.loginnode}';
+        else: 
+            self.ssh_command = f'ssh -tA {self.username}@{self.loginnode}';
 
         # build sbatch command
         self.sbatch_command = ['/bin/bash', '--login', '-c', '"sbatch --parsable"'];
@@ -105,6 +105,8 @@ connection_file=$tmpfile
                     extra_environment += f'export {key}={val}\n';
         except:
             pass;
+        
+        self.log.info('Kernel spec: ' + str(self.kernel_spec.__dict__));
 
         # finally build the Slurm sbatch job
         kernel_command = ' '.join(self.kernel_spec.argv);
@@ -113,6 +115,7 @@ connection_file=$tmpfile
         return await super().pre_launch(**kwargs)
 
     async def launch_kernel (self, cmd: List[str], **kwargs: Any) -> KernelConnectionInfo:
+        self.log.info("LAUCH KERNEL with command: " + str(cmd));
 
         # kernel connection info is now available - add it to the Slurm batch job
         kernel_connection_info = {};
@@ -139,7 +142,7 @@ connection_file=$tmpfile
             # check exit code
             if not self.process.returncode == 0:
                 error_text = child_process_err.decode('utf-8').strip();
-                raise SSHCommandError('Error running the SSH command. Output:\n\n' + error_text + '\n\nYou may want to update your kernelspec file with: $ slurmkernel edit');
+                raise SSHCommandError('Error running the SSH command. Output:\n\n' + error_text + '\n\nYou may want to update your kernelspec file with: $ slurmkernel edit \n\n Command: \n' + str(run_command) + str(self.batch_job))
 
         except TimeoutExpired:
             raise SSHTimeout(f'Timeout expired when calling command\n{" ".join(run_command)}\n\nPlease check your SSH config. Run the command in your terminal to see whats wrong.\nYou may want to update your kernel configuration.');
@@ -155,10 +158,11 @@ connection_file=$tmpfile
                 self.log.info("Slurm job successfully submitted. Slurm job id: " + str(self.job_id));
             except:
                 raise NoSlurmJobID("Could not fetch the Slurm job id!");
-
+        await self.poll();
         return self.connection_info;
 
     def _start_ssh_port_forwarding (self):
+        self.log.info('Starting SSH tunnel to forward kernel ports ' + str(self.exec_node) +' ' + str(self.connection_info));
 
         if self.exec_node:
             if self.connection_info:
@@ -170,9 +174,9 @@ connection_file=$tmpfile
 
                 proxy_jump = '';
                 if self.proxyjump:
-                    proxy_jump = f'-J {self.proxyjump},{self.loginnode}';
+                    proxy_jump = f'-J {self.username}@{self.proxyjump},{self.username}@{self.loginnode}';
                 else:
-                    proxy_jump = f'-J {self.loginnode}';
+                    proxy_jump = f'-J {self.username}@{self.loginnode}';
 
                 ssh_command = ['ssh', '-fNA', '-o', 'StrictHostKeyChecking=no'] + proxy_jump.split(' ') + port_forward.split(' ');
                 ssh_command.append(self.exec_node);
@@ -209,6 +213,7 @@ connection_file=$tmpfile
 
         # 0 = polling
         result = 0;
+        self.log.info('Polling Slurm job state');
         if self.job_id:            
             state, exec_node, estimated_starttime = self._get_slurm_job_state(self.job_id);
             # also returning None if Slurm job is PENDING
@@ -230,23 +235,28 @@ connection_file=$tmpfile
     def get_shutdown_wait_time(self, recommended: float = 60) -> float:
 
         #recommended = 30.0;
-        return 5;
+        return 15.0;
         return super().get_shutdown_wait_time(recommended);
 
     def get_stable_start_time(self, recommended: float = 60) -> float:
 
-        return 5;
+        return 15.0;
         #recommended = 30.0;
         #return super().get_stable_start_time(recommended)
 
     async def send_signal(self, signum: int) -> None:
-
+        self.log.info(f'Sending signal {signum} to Slurm job {self.job_id}');
         if signum == 0:
             return await self.poll();
-        #elif signum == signal.SIGKILL:
-        #    return await self.kill();
+        elif signum == signal.SIGKILL:
+           #return await self.kill();
+            ssh_command = ['ssh', '-tA', f'{self.username}@{self.loginnode}', 'scancel', str(self.job_id)];
+            ssh_scancel_process = Popen(ssh_command, stdout=PIPE, stderr=STDOUT);
+            self.active_port_forwarding = False;
+            self.log.info(f'Killing Slurm job {self.job_id} with command {" ".join(ssh_command)}');            
         else:
             return await super().send_signal(signum);
 
     async def kill(self, restart: bool = False) -> None:
+        self.log.info(f'KILL received with restart={restart}');
         return await super().kill(restart)
